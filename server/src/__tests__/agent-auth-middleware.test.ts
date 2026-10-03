@@ -91,7 +91,7 @@ function createDbState(input: {
     }),
   } as any;
 
-  return { db, activity };
+  return { db, activity, agentRow, keyRow };
 }
 
 function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = "authenticated") {
@@ -564,6 +564,41 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-key",
       source: "agent_key",
     });
+  });
+
+  it("rejects a stored agent API key for a paused agent, and accepts it again after resume", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_agent_key_paused";
+    const { db, agentRow } = createDbState({
+      agent: { id: agentId, companyId, status: "active" },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+      },
+    });
+    const client = createApp(db);
+    const read = () => request(client).get("/actor").set("Authorization", `Bearer ${token}`);
+
+    // The run-JWT branch already rejects `paused`. The long-lived key is not
+    // scoped to a run row at all, so nothing else revokes it: `terminate`
+    // stamps revokedAt but `pause` does not, and the key outlives the pause for
+    // the life of the key. Pause must be revocation here too.
+    agentRow.status = "paused";
+    const paused = await read();
+    expect(paused.status).toBe(401);
+    expect(paused.body.error).toContain("paused");
+
+    // The pause -> resume round trip is the lockout guard: resume flips status
+    // back to idle and the *same* unrevoked key has to work again. Nothing is
+    // re-issued, so this also rules out key revocation on pause.
+    agentRow.status = "idle";
+    const resumed = await read();
+    expect(resumed.status).toBe(200);
+    expect(resumed.body).toMatchObject({ type: "agent", agentId, source: "agent_key" });
   });
 
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {

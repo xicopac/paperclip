@@ -44,7 +44,3 @@ export function unprocessable(message: string, details?: unknown) {
 export function tooManyRequests(message = "Too many requests", details?: unknown) {
   return new HttpError(429, message, details);
 }
-
-export function serviceUnavailable(message = "Service unavailable", details?: unknown) {
-  return new HttpError(503, message, details);
-}
