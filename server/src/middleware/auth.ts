@@ -382,6 +382,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         next(unauthorized("Agent is pending approval and cannot authenticate"));
         return;
       }
+      // Pause is an authorization revocation, not scheduling advice. Only the
+      // board pause route cancels in-flight runs, so the plugin pause path and
+      // the budget pause path leave a running row with a live 48h token; this
+      // is the one choke point every request passes through, so it is where the
+      // pause has to bite.
+      if (agentRecord.status === "paused") {
+        next(unauthorized("Agent is paused and cannot authenticate"));
+        return;
+      }
 
       const normalizedRunIdHeader = normalizeOptionalString(runIdHeader);
       if (normalizedRunIdHeader && normalizedRunIdHeader !== claims.run_id) {
@@ -420,14 +429,28 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         )` }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
         ));
-      if (agentRunWritesRevoked(identityRun)
-        && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        const conversation = identityRun?.contextSnapshot?.conversationMode === true;
+      if (!identityRun) {
+        // The signed run id resolved to no row in this company for this agent,
+        // so the token is not scoped to a live run and must not be treated as
+        // one. Signing secrets are not reachable by a run that was never
+        // launched, but a revoked-and-reissued run id, a restored backup, or a
+        // stale adapter env var must fail here rather than inherit whatever
+        // `responsible_user_id` the claim carries.
+        next(unauthorized("Run for this agent token no longer exists; obtain fresh credentials and retry"));
+        return;
+      }
+      if (agentRunWritesRevoked(identityRun)) {
+        // Fail closed on reads too. A cancelled run has nothing left to read:
+        // the executor is being torn down, and the residual token can live for
+        // the full TTL (48h by default). Carving out GET/HEAD/OPTIONS left that
+        // token with company-wide read access to every issue, document and
+        // secrets listing after the run it was scoped to was already gone.
+        const conversation = identityRun.contextSnapshot?.conversationMode === true;
         _res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
           code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
       }
-      if (identityRun?.hasPendingIdentityContext && identityRun.activeIdentityContextId && identityRun.status === "running") {
+      if (identityRun.hasPendingIdentityContext && identityRun.activeIdentityContextId && identityRun.status === "running") {
         // A steered identity is genuinely waiting to be accepted, so this is
         // the one case that has to take the lock. Bound it: a lock timeout
         // aborts this transaction without applying anything, which is exactly
@@ -459,7 +482,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           return;
         }
       }
-      const onBehalfOfUserId = identityRun?.activeIdentityContextId
+      const onBehalfOfUserId = identityRun.activeIdentityContextId
         ? identityRun.responsibleUserId
         : claims.responsible_user_id !== undefined
         ? normalizeOptionalString(claims.responsible_user_id)
@@ -481,7 +504,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         keyScope: normalizeAgentApiKeyScope(claims.key_scope),
         runId: claims.run_id,
         onBehalfOfUserId,
-        identityContextId: identityRun?.activeIdentityContextId ?? null,
+        identityContextId: identityRun.activeIdentityContextId,
         onBehalfOfMemberships,
         source: "agent_jwt",
       };

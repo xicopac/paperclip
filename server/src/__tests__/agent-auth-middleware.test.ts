@@ -187,7 +187,7 @@ describe("agent auth middleware", () => {
     { status: "running", conversationMode: false, requested: true },
     { status: "cancelled", conversationMode: true, requested: false },
     { status: "running", conversationMode: true, requested: true },
-  ])("revokes writes but preserves reads for a stopped run: %j", async ({ status, conversationMode, requested }) => {
+  ])("revokes reads and writes for a stopped run: %j", async ({ status, conversationMode, requested }) => {
     const agentId = randomUUID();
     const companyId = randomUUID();
     const runId = randomUUID();
@@ -198,12 +198,64 @@ describe("agent auth middleware", () => {
     const token = createLocalAgentJwt(agentId, companyId, "grok_local", runId, null);
     const client = createApp(db);
     const endpoint = `/companies/${companyId}/issues/${randomUUID()}`;
+    const expectedCode = conversationMode ? "conversation_turn_cancelled" : "agent_run_cancelled";
     const write = await request(client).patch(endpoint).set("Authorization", `Bearer ${token}`).send({ status: "done" });
     expect(write.status).toBe(403);
-    expect(write.body.code).toBe(conversationMode ? "conversation_turn_cancelled" : "agent_run_cancelled");
+    expect(write.body.code).toBe(expectedCode);
+    // A stopped run has nothing left to read, and its token can live for the
+    // full 48h TTL. Reads must not stay open behind that.
     const read = await request(client).get(endpoint).set("Authorization", `Bearer ${token}`);
-    expect(read.status).toBe(200);
-    expect(read.body.readable).toBe(true);
+    expect(read.status).toBe(403);
+    expect(read.body.code).toBe(expectedCode);
+    expect(read.body.readable).toBeUndefined();
+  });
+
+  it("rejects a run JWT whose run row no longer matches", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    // No `run` at all: the signed run id resolves to nothing for this agent.
+    const { db } = createDbState({ agent: { id: agentId, companyId } });
+    const token = createLocalAgentJwt(agentId, companyId, "grok_local", runId, "user-claim");
+
+    const read = await request(createApp(db))
+      .get(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`);
+    const write = await request(createApp(db))
+      .patch(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ status: "done" });
+
+    expect(read.status).toBe(401);
+    expect(write.status).toBe(401);
+    expect(read.body.error).toContain("no longer exists");
+  });
+
+  it("rejects a run JWT for a paused agent before it reaches any resource", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "paused" },
+      run: { id: runId, companyId, agentId, status: "running" },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "grok_local", runId, "user-claim");
+    const client = createApp(db);
+
+    // Pause is revocation, not scheduling advice: an in-flight run row can stay
+    // `running` (the plugin and budget pause paths never cancel runs), and the
+    // token outlives the pause by its full TTL.
+    const read = await request(client)
+      .get(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`);
+    const write = await request(client)
+      .patch(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ status: "done" });
+
+    expect(read.status).toBe(401);
+    expect(write.status).toBe(401);
+    expect(read.body.error).toContain("paused");
   });
 
   it("keeps header-less local requests as the implicit board actor with their run id", async () => {
