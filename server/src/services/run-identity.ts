@@ -422,12 +422,30 @@ export async function acceptSteeredIdentity(
   if (accepted) await activate(executor, accepted);
 }
 
+/**
+ * Credential acquisition for a run: resolves the run's active identity context
+ * and, when a steered identity is waiting to be acknowledged, accepts it.
+ *
+ * The row locks are the point — they serialize this read with steering
+ * delivery and its durable acknowledgement — so they are not optional on the
+ * credential-minting paths. They are, however, two `FOR UPDATE` acquisitions on
+ * the run's task row and the run row, which are the hottest rows in the
+ * control plane. `lockTimeoutMs` bounds the wait at the database so a caller on
+ * a request path fails fast and retryable instead of parking a pooled
+ * connection for as long as the blocking transaction lasts. Omit it only where
+ * an unbounded wait is genuinely required.
+ */
 export async function captureRunIdentity(
   db: Db,
-  input: { companyId: string; runId: string; agentId: string },
+  input: { companyId: string; runId: string; agentId: string; lockTimeoutMs?: number },
 ) {
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
   return db.transaction(async (tx) => {
+    if (input.lockTimeoutMs !== undefined) {
+      await tx.execute(
+        sql`set local lock_timeout = ${`${Math.max(1, Math.trunc(input.lockTimeoutMs))}ms`}`,
+      );
+    }
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
       .select()

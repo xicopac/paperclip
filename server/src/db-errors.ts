@@ -1,5 +1,7 @@
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
+/** Postgres aborts a statement that waited longer than `lock_timeout` (SQLSTATE 55P03). */
+const LOCK_NOT_AVAILABLE = "55P03";
 const MAX_CAUSE_DEPTH = 4;
 
 /**
@@ -46,6 +48,25 @@ export function isForeignKeyViolation(error: unknown): boolean {
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
     const candidate = current as { code?: unknown; cause?: unknown };
     if (candidate.code === FOREIGN_KEY_VIOLATION) return true;
+    current = candidate.cause;
+  }
+  return false;
+}
+
+/**
+ * Recognizes a row lock that was not acquired before `lock_timeout` expired
+ * (SQLSTATE 55P03). Reached through `cause` for the same reason as the codes
+ * above: drizzle wraps the driver error in its own `Failed query: ...`.
+ *
+ * A lock timeout is retryable by construction — the blocking transaction is
+ * somebody else's and this one rolled back without applying anything — so
+ * callers can translate it into a bounded 503 instead of an open-ended hang.
+ */
+export function isLockNotAvailable(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (candidate.code === LOCK_NOT_AVAILABLE) return true;
     current = candidate.cause;
   }
   return false;

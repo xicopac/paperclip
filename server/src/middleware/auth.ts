@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -11,6 +11,7 @@ import {
   companyMemberships,
   heartbeatRuns,
   instanceUserRoles,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import {
   MAX_ISSUE_PREFIX_ATTEMPTS,
@@ -26,7 +27,17 @@ import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@pap
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
+import { isLockNotAvailable } from "../db-errors.js";
 import { boardAuthService } from "../services/board-auth.js";
+
+/**
+ * Upper bound on how long an authenticated request waits for the run-identity
+ * capture lock. Kept in single-digit seconds on purpose: a fast, retryable 503
+ * lets the agent back off and retry, where an open-ended wait both strands the
+ * caller and pins one of the shared pool's connections for the duration.
+ */
+const RUN_IDENTITY_LOCK_TIMEOUT_MS = 5_000;
+const RUN_IDENTITY_LOCK_RETRY_AFTER_S = 2;
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -392,9 +403,21 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      // `hasPendingIdentityContext` rides along on the run read the middleware
+      // already performs. It is the only thing that can make
+      // `captureRunIdentity` return something other than what this row already
+      // says, so when it is false the locked capture below is pure cost: two
+      // `FOR UPDATE` acquisitions on the run's task row and the run row, held
+      // for a five-statement transaction, on a pool shared by every request.
+      // Resolving identity from the row the request already holds keeps the
+      // common authenticated request lock-free.
       const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
         responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
-        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        hasPendingIdentityContext: sql`exists (
+          select 1 from ${runIdentityContexts} c
+          where c.run_id = "heartbeat_runs"."id" and c.status = 'pending'
+        )` }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
         ));
       if (agentRunWritesRevoked(identityRun)
@@ -404,10 +427,37 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
       }
-      if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
-        const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id });
-        identityRun.activeIdentityContextId = captured.context?.id ?? null;
-        identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+      if (identityRun?.hasPendingIdentityContext && identityRun.activeIdentityContextId && identityRun.status === "running") {
+        // A steered identity is genuinely waiting to be accepted, so this is
+        // the one case that has to take the lock. Bound it: a lock timeout
+        // aborts this transaction without applying anything, which is exactly
+        // what the agent can retry, rather than a request that parks a pooled
+        // connection until the blocking transaction happens to commit.
+        try {
+          const captured = await captureRunIdentity(db, {
+            companyId: claims.company_id,
+            agentId: claims.sub,
+            runId: claims.run_id,
+            lockTimeoutMs: RUN_IDENTITY_LOCK_TIMEOUT_MS,
+          });
+          identityRun.activeIdentityContextId = captured.context?.id ?? null;
+          identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+        } catch (err) {
+          if (!isLockNotAvailable(err)) throw err;
+          logger.warn(
+            { err, companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id, method: req.method, url: req.originalUrl },
+            "Run identity capture lock timed out; rejecting so the caller can retry",
+          );
+          _res
+            .status(503)
+            .setHeader("Retry-After", String(RUN_IDENTITY_LOCK_RETRY_AFTER_S));
+          _res.json({
+            error: "Run identity is momentarily locked; retry this request",
+            code: "run_identity_lock_timeout",
+            retryAfterSeconds: RUN_IDENTITY_LOCK_RETRY_AFTER_S,
+          });
+          return;
+        }
       }
       const onBehalfOfUserId = identityRun?.activeIdentityContextId
         ? identityRun.responsibleUserId
