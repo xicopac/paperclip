@@ -88,9 +88,13 @@ class FakeWsSocket extends EventEmitter {
 }
 
 /**
- * Minimal drizzle-shaped db for the two tables the upgrade handler touches.
- * `agentStatusById` is read on every status lookup, so a test can flip it
- * between the upgrade and a later keepalive tick.
+ * Minimal drizzle-shaped db for the tables the upgrade handler and the
+ * keepalive re-check touch. `agentStatusById` and `keyRows` are mutable so a
+ * test can change them between an upgrade and a later tick.
+ *
+ * The two `agentApiKeys` reads are told apart by their projection: the upgrade
+ * lookup is `db.select()` (undefined fields, filtered on `isNull(revokedAt)`)
+ * and the batched re-check selects `{ id, revokedAt }` and returns raw rows.
  */
 function createFakeDb(opts: {
   keyRow?: Record<string, unknown> | null;
@@ -98,16 +102,25 @@ function createFakeDb(opts: {
   /** Runs on every agent-status read; used to stop before the ws handshake. */
   onStatusRead?: () => void;
 }) {
-  const state = { lastUsedAtWrites: 0, statusReads: 0 };
+  const state = {
+    lastUsedAtWrites: 0,
+    statusReads: 0,
+    keyBatchReads: 0,
+    keyRows: opts.keyRow ? [{ ...opts.keyRow }] : [],
+  };
   const agentStatusById = opts.agentStatusById ?? {};
 
   const db = {
-    select: () => ({
+    select: (fields?: Record<string, unknown>) => ({
       from(table: unknown) {
         return {
           where() {
             if (table === agentApiKeys) {
-              return Promise.resolve(opts.keyRow ? [opts.keyRow] : []);
+              if (fields) {
+                state.keyBatchReads += 1;
+                return Promise.resolve(state.keyRows);
+              }
+              return Promise.resolve(state.keyRows.filter((row) => row.revokedAt === null));
             }
             opts.onStatusRead?.();
             state.statusReads += 1;
@@ -309,6 +322,40 @@ describe("setupLiveEventsWebSocketServer", () => {
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
   });
 
+  // `skill_test` is pinned to one issue and `task_bridge` to a project/parent
+  // boundary; both are enforced centrally on HTTP. This socket subscribes to the
+  // whole company feed with no per-event filtering, so a narrowed key that got
+  // through would receive exactly the data its sandbox exists to withhold.
+  it.each([
+    ["skill_test", { kind: "skill_test", issueId: "11111111-1111-4111-8111-111111111111" }],
+    [
+      "task_bridge",
+      {
+        kind: "task_bridge",
+        projectId: "11111111-1111-4111-8111-111111111111",
+        allowedAssigneeAgentIds: ["22222222-2222-4222-8222-222222222222"],
+      },
+    ],
+  ])("refuses a %s scoped agent key the live feed", async (_kind, scopeConfig) => {
+    const server = new EventEmitter();
+    const { db, state } = createFakeDb({
+      keyRow: { ...agentKeyRow, scopeConfig },
+      agentStatusById: { "agent-1": "active" },
+    });
+    setupLiveEventsWebSocketServer(server as never, db as never, { deploymentMode: "authenticated" });
+    const socket = new FakeUpgradeSocket();
+
+    server.emit("upgrade", createAgentKeyRequest(), socket as unknown as Duplex, Buffer.alloc(0));
+    await flushPromises();
+    await flushPromises();
+
+    expect(socket.endedChunks[0]).toContain("403 Forbidden");
+    expect(socket.endedChunks.join("")).not.toContain("agent-1");
+    // Refused before any status read or key write: a narrowed key learns nothing.
+    expect(state.statusReads).toBe(0);
+    expect(state.lastUsedAtWrites).toBe(0);
+  });
+
   it("authorizes a stored agent key for an invokable agent and touches the key", async () => {
     const server = new EventEmitter();
     const socket = new FakeUpgradeSocket();
@@ -348,7 +395,12 @@ describe("setupLiveEventsWebSocketServer", () => {
         "connection",
         socket as never,
         {
-          paperclipUpgradeContext: { companyId: "company-1", actorType: "agent", actorId: "agent-1" },
+          paperclipUpgradeContext: {
+            companyId: "company-1",
+            actorType: "agent",
+            actorId: "agent-1",
+            keyId: "key-1",
+          },
         } as never,
       );
 
@@ -387,7 +439,12 @@ describe("setupLiveEventsWebSocketServer", () => {
         "connection",
         socket as never,
         {
-          paperclipUpgradeContext: { companyId: "company-1", actorType: "agent", actorId: "agent-1" },
+          paperclipUpgradeContext: {
+            companyId: "company-1",
+            actorType: "agent",
+            actorId: "agent-1",
+            keyId: "key-1",
+          },
         } as never,
       );
 
@@ -395,6 +452,132 @@ describe("setupLiveEventsWebSocketServer", () => {
       await vi.advanceTimersByTimeAsync(30000);
 
       expect(socket.closeCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // P1: `revokeKey` stamps `revokedAt` and touches nothing else — it does not
+  // pause or terminate the agent. Without a key re-check the status read sees a
+  // perfectly healthy agent and the socket streams company events forever, which
+  // defeats the point of revoking a suspected-compromised credential.
+  it("closes an open agent socket within one keepalive interval after its key is revoked", async () => {
+    vi.useFakeTimers();
+    try {
+      const server = new EventEmitter();
+      const { db, state, agentStatusById } = createFakeDb({
+        keyRow: agentKeyRow,
+        agentStatusById: { "agent-1": "active" },
+      });
+      const wss = setupLiveEventsWebSocketServer(server as never, db as never, {
+        deploymentMode: "authenticated",
+      });
+      const socket = new FakeWsSocket();
+      wss.clients.add(socket as never);
+      wss.emit(
+        "connection",
+        socket as never,
+        {
+          paperclipUpgradeContext: {
+            companyId: "company-1",
+            actorType: "agent",
+            actorId: "agent-1",
+            keyId: "key-1",
+          },
+        } as never,
+      );
+
+      await vi.advanceTimersByTimeAsync(30000);
+      socket.emit("pong");
+      expect(socket.closeCalls).toEqual([]);
+      expect(state.keyBatchReads).toBe(1);
+
+      // The agent is untouched by revocation — only the key row changes.
+      expect(agentStatusById["agent-1"]).toBe("active");
+      state.keyRows[0]!.revokedAt = new Date();
+      await vi.advanceTimersByTimeAsync(30000);
+
+      expect(socket.closeCalls).toEqual([{ code: 1008, reason: "agent no longer authorized" }]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: "agent-1", keyId: "key-1", keyRevoked: true }),
+        expect.stringContaining("no longer authorized"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes an open agent socket when its key row disappears", async () => {
+    vi.useFakeTimers();
+    try {
+      const server = new EventEmitter();
+      const { db, state } = createFakeDb({
+        keyRow: agentKeyRow,
+        agentStatusById: { "agent-1": "active" },
+      });
+      const wss = setupLiveEventsWebSocketServer(server as never, db as never, {
+        deploymentMode: "authenticated",
+      });
+      const socket = new FakeWsSocket();
+      wss.clients.add(socket as never);
+      wss.emit(
+        "connection",
+        socket as never,
+        {
+          paperclipUpgradeContext: {
+            companyId: "company-1",
+            actorType: "agent",
+            actorId: "agent-1",
+            keyId: "key-1",
+          },
+        } as never,
+      );
+
+      state.keyRows.length = 0;
+      await vi.advanceTimersByTimeAsync(30000);
+
+      expect(socket.closeCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves open sockets alone when the re-check read fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const server = new EventEmitter();
+      // A transient database error must not become a disconnect storm.
+      const explodingDb = {
+        select: () => {
+          throw new Error("connection reset");
+        },
+      };
+      const wss = setupLiveEventsWebSocketServer(server as never, explodingDb as never, {
+        deploymentMode: "authenticated",
+      });
+      const socket = new FakeWsSocket();
+      wss.clients.add(socket as never);
+      wss.emit(
+        "connection",
+        socket as never,
+        {
+          paperclipUpgradeContext: {
+            companyId: "company-1",
+            actorType: "agent",
+            actorId: "agent-1",
+            keyId: "key-1",
+          },
+        } as never,
+      );
+
+      await vi.advanceTimersByTimeAsync(30000);
+
+      expect(socket.closeCalls).toEqual([]);
+      expect(socket.terminateCalls).toBe(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        "live websocket agent revalidation failed",
+      );
     } finally {
       vi.useRealTimers();
     }

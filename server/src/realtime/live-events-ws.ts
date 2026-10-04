@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import { isAgentStatusInvokable, type DeploymentMode } from "@paperclipai/shared";
+import { isAgentStatusInvokable, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -44,6 +44,8 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /** Set for agent-key actors only, so revocation can be re-checked per socket. */
+  keyId?: string;
 }
 
 /** Cloud-proxied browser identity resolved from trusted x-paperclip-cloud-* headers. */
@@ -212,6 +214,26 @@ async function authorizeUpgrade(
     return null;
   }
 
+  // Narrowed scopes are the platform's low-trust key tier: `skill_test` is
+  // pinned to one issue, `task_bridge` to a project/parent-issue boundary, and
+  // both are enforced centrally on HTTP (services/authorization.ts branches on
+  // actor.keyScope). This socket subscribes to the whole company event stream
+  // with no per-event filtering, so a narrowed key that got through here would
+  // receive company-wide assistant text, activity payloads and goal projections
+  // — the exact data its sandbox exists to withhold. There is no consistent
+  // world in which such a key is confined over HTTP and not over a socket, and
+  // no shipped consumer needs it: every WS client today connects with a board
+  // session. Refuse narrowed scopes here rather than re-implementing scope
+  // decisions inside the subscriber.
+  const keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
+  if (keyScope.kind !== "standard") {
+    logger.warn(
+      { companyId, agentId: key.agentId, scope: keyScope.kind },
+      "rejected live websocket upgrade for a narrowed-scope agent key",
+    );
+    return null;
+  }
+
   // An `agentApiKeys` row is not self-revoking, and this upgrade handler is a
   // raw `server.on("upgrade")` listener — it never reaches Express or
   // `actorMiddleware`, so the middleware's status checks cannot cover it. Without
@@ -247,6 +269,7 @@ async function authorizeUpgrade(
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    keyId: key.id,
   };
 }
 
@@ -271,40 +294,79 @@ export function setupLiveEventsWebSocketServer(
   // key has no expiry and no run row, so the only thing that can take a live
   // subscription away is a status change we re-read ourselves.
   const agentIdByClient = new Map<WsSocket, string>();
+  const keyIdByClient = new Map<WsSocket, string>();
 
   /**
-   * Closes sockets whose agent stopped being invokable after the upgrade was
-   * authorized. The 30s ping/pong keepalive performs no re-authorization, so
-   * without this an agent paused mid-connection keeps streaming company events
-   * until its client disconnects. This bounds that window at one keepalive
-   * interval rather than eliminating it — the alternative is an event-driven
-   * close wired into every pause writer, and there are five of those, three of
-   * which write `agents.status` in raw SQL.
+   * Closes sockets whose authorization no longer holds. Two independent reasons,
+   * and the second matters more than the pause case:
+   *
+   * - The agent stopped being invokable (paused, terminated, deleted). Bounded
+   *   by this interval, and acceptable: pause does not revoke the key, so during
+   *   the residual window the credential is still entitled to the same
+   *   company-scoped data it could fetch over HTTP anyway.
+   * - **The key was revoked.** `revokeKey` stamps `revokedAt` and touches
+   *   nothing else — it does not pause or terminate the agent — so the status
+   *   read alone would see a healthy agent and let the socket stream company
+   *   events indefinitely. Revoking a key is the incident-response action for a
+   *   suspected credential compromise, and a revoked credential must not keep
+   *   live read access. That one is unbounded without this check.
+   *
+   * The alternative for the status half is an event-driven close wired into
+   * every pause writer, and there are five of those, three of which write
+   * `agents.status` in raw SQL — a missed hook there fails silently and
+   * permanently. A missed tick is bounded and self-heals on the next one.
    */
   let revalidateInFlight = false;
   const revalidateAgentSockets = async () => {
     if (revalidateInFlight) return;
     const agentIds = [...new Set(agentIdByClient.values())];
-    if (agentIds.length === 0) return;
+    const keyIds = [...new Set(keyIdByClient.values())];
+    if (agentIds.length === 0 && keyIds.length === 0) return;
 
     revalidateInFlight = true;
     try {
-      const rows = await db
-        .select({ id: agents.id, status: agents.status })
-        .from(agents)
-        .where(inArray(agents.id, agentIds));
+      const agentRows = agentIds.length
+        ? await db
+            .select({ id: agents.id, status: agents.status })
+            .from(agents)
+            .where(inArray(agents.id, agentIds))
+        : [];
+      const keyRows = keyIds.length
+        ? await db
+            .select({ id: agentApiKeys.id, revokedAt: agentApiKeys.revokedAt })
+            .from(agentApiKeys)
+            .where(inArray(agentApiKeys.id, keyIds))
+        : [];
 
-      const statusByAgentId = new Map(rows.map((row) => [row.id, row.status]));
+      const statusByAgentId = new Map(agentRows.map((row) => [row.id, row.status]));
+      const revokedAtByKeyId = new Map(keyRows.map((row) => [row.id, row.revokedAt]));
+
       for (const [socket, agentId] of [...agentIdByClient]) {
+        const keyId = keyIdByClient.get(socket);
         const status = statusByAgentId.get(agentId);
-        // A vanished agent row fails closed for the same reason a missing actor
-        // does at upgrade time.
-        if (status !== undefined && isAgentStatusInvokable(status)) continue;
+
+        const statusOk = status !== undefined && isAgentStatusInvokable(status);
+
+        // `has` before `get`: an unrevoked key carries revokedAt === null, which
+        // a bare `get(id) ?? fallback` would read as "no row". A key missing from
+        // the table failed the same way a revoked one does — the credential
+        // behind this socket no longer exists.
+        const keyRowPresent = keyId !== undefined && revokedAtByKeyId.has(keyId);
+        const keyRevoked = keyRowPresent && revokedAtByKeyId.get(keyId) != null;
+        const keyOk = keyRowPresent && !keyRevoked;
+        if (statusOk && keyOk) continue;
 
         agentIdByClient.delete(socket);
+        keyIdByClient.delete(socket);
         logger.warn(
-          { agentId, status: status ?? null },
-          "closing live websocket for an agent that is no longer invokable",
+          {
+            agentId,
+            keyId: keyId ?? null,
+            status: status ?? null,
+            keyRevoked,
+            keyMissing: keyId !== undefined && !keyRowPresent,
+          },
+          "closing live websocket for an agent or credential that is no longer authorized",
         );
         try {
           socket.close(1008, "agent no longer authorized");
@@ -350,6 +412,9 @@ export function setupLiveEventsWebSocketServer(
     aliveByClient.set(socket, true);
     if (context.actorType === "agent") {
       agentIdByClient.set(socket, context.actorId);
+      if (context.keyId) {
+        keyIdByClient.set(socket, context.keyId);
+      }
     }
 
     socket.on("pong", () => {
@@ -362,6 +427,7 @@ export function setupLiveEventsWebSocketServer(
       cleanupByClient.delete(socket);
       aliveByClient.delete(socket);
       agentIdByClient.delete(socket);
+      keyIdByClient.delete(socket);
     });
 
     socket.on("error", (err: Error) => {
