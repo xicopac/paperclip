@@ -23,7 +23,7 @@ import {
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { isUuidLike, isAgentStatusInvokable, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
@@ -387,8 +387,26 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       // the budget pause path leave a running row with a live 48h token; this
       // is the one choke point every request passes through, so it is where the
       // pause has to bite.
+      //
+      // 403 with a distinct code, deliberately not 401 — same reasoning as the
+      // stored-key branch below: the CLI arms board-auth recovery on any 401 and
+      // replays the request with board credentials. 401 would turn "this agent
+      // is paused" into a privilege escalation for an interactive session.
       if (agentRecord.status === "paused") {
-        next(unauthorized("Agent is paused and cannot authenticate"));
+        next(forbidden("Agent is paused and cannot authenticate", { code: "agent_paused" }));
+        return;
+      }
+      // Fail closed on any status outside the invokable set. The three checks
+      // above name every status the enum declares today, so this only fires for
+      // a value a future migration, import, or manual write introduces — and it
+      // has to fail closed, because `agents.status` is a plain text column with
+      // no DB enum or check constraint. Same predicate the scheduler uses to
+      // decide whether an agent may be given work, which is the right definition
+      // of "may authenticate".
+      if (!isAgentStatusInvokable(agentRecord.status)) {
+        next(forbidden("Agent is not in an invokable status and cannot authenticate", {
+          code: "agent_not_invokable",
+        }));
         return;
       }
 
@@ -512,11 +530,6 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
-
     const agentRecord = await db
       .select()
       .from(agents)
@@ -554,6 +567,25 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       next(forbidden("Agent is paused and cannot authenticate", { code: "agent_paused" }));
       return;
     }
+    // Fail closed on any status outside the invokable set — same predicate, same
+    // reasoning as the run-JWT branch above. `agents.status` is a plain text
+    // column, so the deny-list of three named statuses is only complete for
+    // today's enum.
+    if (!isAgentStatusInvokable(agentRecord.status)) {
+      next(forbidden("Agent is not in an invokable status and cannot authenticate", {
+        code: "agent_not_invokable",
+      }));
+      return;
+    }
+
+    // Touch the key only now that the request has actually authenticated.
+    // Writing `lastUsedAt` for a rejected request makes "last used" telemetry
+    // wrong for a paused key and gives a paused-but-still-retrying credential a
+    // free DB write on every attempt.
+    await db
+      .update(agentApiKeys)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(agentApiKeys.id, key.id));
 
     const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
     if (!responsibleUserId) {

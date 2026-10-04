@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { isAgentStatusInvokable, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -212,6 +212,32 @@ async function authorizeUpgrade(
     return null;
   }
 
+  // An `agentApiKeys` row is not self-revoking, and this upgrade handler is a
+  // raw `server.on("upgrade")` listener — it never reaches Express or
+  // `actorMiddleware`, so the middleware's status checks cannot cover it. Without
+  // this read, a paused (or pending-approval, or terminated-but-not-yet-swept)
+  // agent's stored key opens a socket and gets subscribed to the whole company
+  // event stream for the life of the connection. Same fail-closed predicate as
+  // the middleware; terminate's revokedAt sweep is a second line of defence for
+  // the terminated case, not the only one.
+  const agentRecord = await db
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(eq(agents.id, key.agentId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!agentRecord || agentRecord.companyId !== key.companyId) {
+    return null;
+  }
+
+  if (!isAgentStatusInvokable(agentRecord.status)) {
+    logger.warn(
+      { companyId, agentId: key.agentId, status: agentRecord.status },
+      "rejected live websocket upgrade for a non-invokable agent",
+    );
+    return null;
+  }
+
   await db
     .update(agentApiKeys)
     .set({ lastUsedAt: new Date() })
@@ -241,6 +267,60 @@ export function setupLiveEventsWebSocketServer(
   const wss = new WebSocketServer({ noServer: true });
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
+  // Agent-key sockets only. A board actor is governed by its session; an agent
+  // key has no expiry and no run row, so the only thing that can take a live
+  // subscription away is a status change we re-read ourselves.
+  const agentIdByClient = new Map<WsSocket, string>();
+
+  /**
+   * Closes sockets whose agent stopped being invokable after the upgrade was
+   * authorized. The 30s ping/pong keepalive performs no re-authorization, so
+   * without this an agent paused mid-connection keeps streaming company events
+   * until its client disconnects. This bounds that window at one keepalive
+   * interval rather than eliminating it — the alternative is an event-driven
+   * close wired into every pause writer, and there are five of those, three of
+   * which write `agents.status` in raw SQL.
+   */
+  let revalidateInFlight = false;
+  const revalidateAgentSockets = async () => {
+    if (revalidateInFlight) return;
+    const agentIds = [...new Set(agentIdByClient.values())];
+    if (agentIds.length === 0) return;
+
+    revalidateInFlight = true;
+    try {
+      const rows = await db
+        .select({ id: agents.id, status: agents.status })
+        .from(agents)
+        .where(inArray(agents.id, agentIds));
+
+      const statusByAgentId = new Map(rows.map((row) => [row.id, row.status]));
+      for (const [socket, agentId] of [...agentIdByClient]) {
+        const status = statusByAgentId.get(agentId);
+        // A vanished agent row fails closed for the same reason a missing actor
+        // does at upgrade time.
+        if (status !== undefined && isAgentStatusInvokable(status)) continue;
+
+        agentIdByClient.delete(socket);
+        logger.warn(
+          { agentId, status: status ?? null },
+          "closing live websocket for an agent that is no longer invokable",
+        );
+        try {
+          socket.close(1008, "agent no longer authorized");
+        } catch (err) {
+          logger.warn({ err, agentId }, "failed to close live websocket for a non-invokable agent");
+          socket.terminate();
+        }
+      }
+    } catch (err) {
+      // Never tear sockets down on a failed read: a transient database error
+      // must not become a self-inflicted disconnect storm.
+      logger.warn({ err }, "live websocket agent revalidation failed");
+    } finally {
+      revalidateInFlight = false;
+    }
+  };
 
   const pingInterval = setInterval(() => {
     for (const socket of wss.clients) {
@@ -251,6 +331,7 @@ export function setupLiveEventsWebSocketServer(
       aliveByClient.set(socket, false);
       socket.ping();
     }
+    void revalidateAgentSockets();
   }, 30000);
 
   wss.on("connection", (socket: WsSocket, req: IncomingMessage) => {
@@ -267,6 +348,9 @@ export function setupLiveEventsWebSocketServer(
 
     cleanupByClient.set(socket, unsubscribe);
     aliveByClient.set(socket, true);
+    if (context.actorType === "agent") {
+      agentIdByClient.set(socket, context.actorId);
+    }
 
     socket.on("pong", () => {
       aliveByClient.set(socket, true);
@@ -277,6 +361,7 @@ export function setupLiveEventsWebSocketServer(
       if (cleanup) cleanup();
       cleanupByClient.delete(socket);
       aliveByClient.delete(socket);
+      agentIdByClient.delete(socket);
     });
 
     socket.on("error", (err: Error) => {

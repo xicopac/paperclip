@@ -253,9 +253,63 @@ describe("agent auth middleware", () => {
       .set("Authorization", `Bearer ${token}`)
       .send({ status: "done" });
 
-    expect(read.status).toBe(401);
-    expect(write.status).toBe(401);
+    expect(read.status).toBe(403);
+    expect(write.status).toBe(403);
+    expect(read.body.code).toBe("agent_paused");
     expect(read.body.error).toContain("paused");
+    // Not a 401: the CLI arms board-auth recovery on any 401 and replays the
+    // request with board credentials, so the run-JWT branch has to deny the same
+    // way the stored-key branch does. 160 lines apart in one function is exactly
+    // how the two drifted in the first place.
+    expect(read.body.error).not.toContain("Board access required");
+    expect(read.body.error).not.toContain("Instance admin required");
+  });
+
+  // `agents.status` is a plain text column: no DB enum, no check constraint. A
+  // deny-list of the three named statuses is complete only for today's enum, so
+  // both branches fail closed on anything outside the invokable set.
+  it("rejects a stored agent key for an agent in an unknown status", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const token = "pcp_test_agent_key_unknown_status";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "hibernating" },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+      },
+    });
+
+    const res = await request(createApp(db))
+      .get(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("agent_not_invokable");
+    // The raw column value must not be echoed back into the response body.
+    expect(res.body.error).not.toContain("hibernating");
+  });
+
+  it("rejects a run JWT for an agent in an unknown status", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "hibernating" },
+      run: { id: runId, companyId, agentId, status: "running" },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "grok_local", runId, "user-claim");
+
+    const res = await request(createApp(db))
+      .get(`/companies/${companyId}/issues/${randomUUID()}`)
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("agent_not_invokable");
+    expect(res.body.error).not.toContain("hibernating");
   });
 
   it("keeps header-less local requests as the implicit board actor with their run id", async () => {
@@ -599,7 +653,16 @@ describe("agent auth middleware", () => {
     expect(paused.body.error).toContain("paused");
     expect(paused.body.error).not.toContain("Board access required");
     expect(paused.body.error).not.toContain("Instance admin required");
-    expect(paused.body.agentId).toBeUndefined();
+    // Pin the whole denial shape, not just the absence of one field: the body
+    // must be exactly this, so no actor identity, agent id or key id can leak
+    // into it later. `details` mirroring `code` is the error handler's existing
+    // behaviour for every `HttpError` with details, not something this change
+    // introduces.
+    expect(paused.body).toEqual({
+      error: "Agent is paused and cannot authenticate",
+      code: "agent_paused",
+      details: { code: "agent_paused" },
+    });
 
     // The pause -> resume round trip is the lockout guard: resume flips status
     // back to idle and the *same* unrevoked key has to work again. Nothing is
