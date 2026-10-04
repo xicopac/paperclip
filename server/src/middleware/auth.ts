@@ -535,6 +535,25 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       next(unauthorized("Agent is pending approval and cannot authenticate"));
       return;
     }
+    // Pause is an authorization revocation for a stored key too. `terminate`
+    // stamps revokedAt on every agentApiKeys row (agents.ts:1039) but `pause`
+    // does not, and unlike a run JWT this credential has no run row to lose and
+    // no expiry, so nothing else takes it away: an operator pausing an agent
+    // would otherwise leave its key working for the life of the key. Every
+    // pause path -- board route, plugin host, budget scope, import -- converges
+    // on this middleware, so this is the one place the pause has to bite.
+    //
+    // 403 with a distinct code, deliberately not 401: the CLI arms board-auth
+    // recovery on any 401 and then retries the same request with board
+    // credentials (shouldRecoverBoardAuth in cli/src/commands/client/common.ts
+    // plus the retry in cli/src/client/http.ts), so a 401 here would turn "this
+    // agent is paused" into a privilege escalation for an interactive session.
+    // shouldRecoverBoardAuth only arms on a 403 whose message says board or
+    // instance-admin access is required, which this message must not.
+    if (agentRecord.status === "paused") {
+      next(forbidden("Agent is paused and cannot authenticate", { code: "agent_paused" }));
+      return;
+    }
 
     const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
     if (!responsibleUserId) {

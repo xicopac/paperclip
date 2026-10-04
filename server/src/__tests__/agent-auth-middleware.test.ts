@@ -589,8 +589,17 @@ describe("agent auth middleware", () => {
     // the life of the key. Pause must be revocation here too.
     agentRow.status = "paused";
     const paused = await read();
-    expect(paused.status).toBe(401);
+    expect(paused.status).toBe(403);
+    expect(paused.body.code).toBe("agent_paused");
+    // Pin the reason this is not a 401: the CLI arms board-auth recovery on
+    // any 401 and retries the request with board credentials, and on a 403 it
+    // arms only for board/instance-admin messages. If this message ever gains
+    // one of those phrases, a paused agent's call gets retried with elevated
+    // board credentials.
     expect(paused.body.error).toContain("paused");
+    expect(paused.body.error).not.toContain("Board access required");
+    expect(paused.body.error).not.toContain("Instance admin required");
+    expect(paused.body.agentId).toBeUndefined();
 
     // The pause -> resume round trip is the lockout guard: resume flips status
     // back to idle and the *same* unrevoked key has to work again. Nothing is
