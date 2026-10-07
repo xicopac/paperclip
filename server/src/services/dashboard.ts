@@ -1,11 +1,17 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
-import { executionIssueCondition } from "./issue-visibility.js";
+import { issueService } from "./issues.js";
+import { executionIssueCondition, visibleIssueCondition } from "./issue-visibility.js";
+import { externalConversationStateSql } from "./slack-conversation-state.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
+const DASHBOARD_TREND_ISSUES_DAYS = 14;
+export const DASHBOARD_RECENT_ISSUES_LIMIT = 10;
+export const DASHBOARD_ISSUE_REF_LIMIT = 2000;
+export const DASHBOARD_TREND_ISSUES_LIMIT = 1000;
 
 function formatUtcDateKey(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -25,6 +31,7 @@ function getRecentUtcDateKeys(now: Date, days: number): string[] {
 
 export function dashboardService(db: Db) {
   const budgets = budgetService(db);
+  const issueSvc = issueService(db);
   return {
     summary: async (companyId: string) => {
       const company = await db
@@ -185,6 +192,83 @@ export function dashboardService(db: Db) {
           : 0;
       const budgetOverview = await budgets.overview(companyId);
 
+      // Bounded dashboard-only issue projections, replacing the full issue list
+      // the Dashboard used to fetch only to slice a recent-task list, two
+      // 14-day charts and an id->identifier map out of it. issues_company_updated_idx
+      // and issues_company_created_idx cover the two ordered reads.
+      const visibleIssues = and(eq(issues.companyId, companyId), visibleIssueCondition());
+      const [recentIssueRows, issueRefRows, trendIssueRows] = await Promise.all([
+        db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            parentId: issues.parentId,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            priority: issues.priority,
+            updatedAt: issues.updatedAt,
+            assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+            executionRunId: issues.executionRunId,
+            externalConversationState: externalConversationStateSql(),
+          })
+          .from(issues)
+          .where(visibleIssues)
+          .orderBy(desc(issues.updatedAt))
+          .limit(DASHBOARD_RECENT_ISSUES_LIMIT),
+        db
+          .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+          .from(issues)
+          .where(visibleIssues)
+          .orderBy(desc(issues.createdAt))
+          .limit(DASHBOARD_ISSUE_REF_LIMIT),
+        db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            priority: issues.priority,
+            createdAt: issues.createdAt,
+          })
+          .from(issues)
+          .where(
+            and(
+              visibleIssues,
+              sql`${issues.createdAt} >= now() - (${DASHBOARD_TREND_ISSUES_DAYS} * interval '1 day')`,
+            ),
+          )
+          .orderBy(desc(issues.createdAt))
+          .limit(DASHBOARD_TREND_ISSUES_LIMIT),
+      ]);
+
+      const blockerAttentionByIssueId = await issueSvc.listBlockerAttention(
+        companyId,
+        recentIssueRows,
+      );
+
+      const recentIssues = recentIssueRows.map((row) => ({
+        id: row.id,
+        identifier: row.identifier,
+        title: row.title,
+        status: row.status,
+        priority: row.priority,
+        updatedAt: row.updatedAt.toISOString(),
+        assigneeAgentId: row.assigneeAgentId,
+        externalConversationState: row.externalConversationState ?? null,
+        blockerAttention: blockerAttentionByIssueId.get(row.id),
+      }));
+      const issueRefs = issueRefRows.map((row) => ({
+        id: row.id,
+        identifier: row.identifier,
+        title: row.title,
+      }));
+      const trendIssues = trendIssueRows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        priority: row.priority,
+        createdAt: row.createdAt.toISOString(),
+      }));
+
       return {
         companyId,
         agents: {
@@ -207,6 +291,9 @@ export function dashboardService(db: Db) {
           pausedProjects: budgetOverview.pausedProjectCount,
         },
         runActivity: Array.from(runActivity.values()),
+        recentIssues,
+        issueRefs,
+        trendIssues,
       };
     },
   };

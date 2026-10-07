@@ -8,10 +8,9 @@ import {
 import { claimOnboardingOffer } from "../lib/onboarding-auto-open";
 import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { dashboardApi } from "../api/dashboard";
+import { dashboardApi, type DashboardRecentIssue } from "../api/dashboard";
 import { activityApi } from "../api/activity";
 import { accessApi } from "../api/access";
-import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
 import { buildCompanyUserProfileMap } from "../lib/company-members";
@@ -35,13 +34,13 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { InlineBanner } from "../components/InlineBanner";
-import type { Agent, Issue } from "@paperclipai/shared";
+import type { Agent } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
 import { SmokeLabDashboardCard } from "../components/SmokeLabDashboardCard";
 
 const DASHBOARD_ACTIVITY_LIMIT = 10;
 
-function getRecentIssues(issues: Issue[]): Issue[] {
+function getRecentIssues(issues: DashboardRecentIssue[]): DashboardRecentIssue[] {
   return [...issues]
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
 }
@@ -186,12 +185,6 @@ export function Dashboard() {
   });
   usePublishSharedQueryData(sharedActivity, activity, activityUpdatedAt);
 
-  const { data: issues } = useQuery({
-    queryKey: queryKeys.issues.list(selectedCompanyId!),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-  });
-
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(selectedCompanyId!, { includeArchived: true }),
     queryFn: () => projectsApi.list(selectedCompanyId!, { includeArchived: true }),
@@ -209,7 +202,10 @@ export function Dashboard() {
     [companyMembers?.users],
   );
 
-  const recentIssues = issues ? getRecentIssues(issues) : [];
+  const recentIssues = useMemo(
+    () => (data?.recentIssues ? getRecentIssues(data.recentIssues) : []),
+    [data?.recentIssues],
+  );
   const recentActivity = useMemo(() => (activity ?? []).slice(0, 10), [activity]);
 
   useEffect(() => {
@@ -275,17 +271,17 @@ export function Dashboard() {
 
   const entityNameMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const i of issues ?? []) map.set(`issue:${i.id}`, i.identifier ?? i.id.slice(0, 8));
+    for (const i of data?.issueRefs ?? []) map.set(`issue:${i.id}`, i.identifier ?? i.id.slice(0, 8));
     for (const a of agents ?? []) map.set(`agent:${a.id}`, a.name);
     for (const p of projects ?? []) map.set(`project:${p.id}`, p.name);
     return map;
-  }, [issues, agents, projects]);
+  }, [data?.issueRefs, agents, projects]);
 
   const entityTitleMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const i of issues ?? []) map.set(`issue:${i.id}`, i.title);
+    for (const i of data?.issueRefs ?? []) map.set(`issue:${i.id}`, i.title);
     return map;
-  }, [issues]);
+  }, [data?.issueRefs]);
 
   const agentName = (id: string | null) => {
     if (!id || !agents) return null;
@@ -460,11 +456,11 @@ export function Dashboard() {
             {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
             {SHOW_TASK_PRIORITY_UI && (
               <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
-                <PriorityChart issues={issues ?? []} />
+                <PriorityChart issues={data.trendIssues ?? []} />
               </ChartCard>
             )}
             <ChartCard title="Tasks by Status" subtitle="Last 14 days">
-              <IssueStatusChart issues={issues ?? []} />
+              <IssueStatusChart issues={data.trendIssues ?? []} />
             </ChartCard>
             <ChartCard title="Success Rate" subtitle="Last 14 days">
               <SuccessRateChart activity={data.runActivity} />

@@ -24,6 +24,39 @@ export interface DashboardRunActivityDay {
   failedByErrorCode: Record<string, number>;
 }
 
+import type { Issue } from "./issue.js";
+
+/** Recent-task row for the dashboard, ordered by `updated_at` desc. Field types
+ * mirror `Issue` so the same components accept either source. */
+export interface DashboardRecentIssue {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string;
+  /** ISO-8601 timestamp. */
+  updatedAt: string;
+  assigneeAgentId: string | null;
+  externalConversationState: Issue["externalConversationState"];
+  blockerAttention: Issue["blockerAttention"];
+}
+
+/** Id → identifier/title map row for one visible issue in the company. */
+export interface DashboardIssueRef {
+  id: string;
+  identifier: string | null;
+  title: string;
+}
+
+/** Status/priority chart input, ordered by `created_at` desc inside the window. */
+export interface DashboardTrendIssue {
+  id: string;
+  status: string;
+  priority: string;
+  /** ISO-8601 timestamp. */
+  createdAt: string;
+}
+
 export interface DashboardSummary {
   companyId: string;
   agents: {
@@ -51,4 +84,7 @@ export interface DashboardSummary {
     pausedProjects: number;
   };
   runActivity: DashboardRunActivityDay[];
+  recentIssues?: DashboardRecentIssue[];
+  issueRefs?: DashboardIssueRef[];
+  trendIssues?: DashboardTrendIssue[];
 }
