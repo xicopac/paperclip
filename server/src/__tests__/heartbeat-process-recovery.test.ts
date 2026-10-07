@@ -1398,6 +1398,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  function issueUpdatedActivityCount(issueId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.action, "issue.updated"),
+        ),
+      )
+      .then((rows) => rows.length);
+  }
+
   async function seedQueuedIssueRunFixture() {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -8732,7 +8746,163 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(inArray(agentWakeupRequests.agentId, executiveIds));
     expect(wakes).toHaveLength(0);
+    // Escalating to the board must not attempt a wake either: `enqueueWakeup`
+    // would write an `agent.not_invokable` skipped request on every sweep.
+    expect(
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId)),
+    ).toEqual([]);
   });
+
+  it("does not enqueue a wake for a paused assigned todo issue and stays idempotent across sweeps", async () => {
+    const { agentId, issueId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "paused",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.escalated).toBe(1);
+    expect(first.assignmentDispatched).toBe(0);
+    expect(first.issueIds).toEqual([issueId]);
+    expect(
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId)),
+    ).toEqual([]);
+
+    const [afterFirst] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const updatedActivityAfterFirst = await issueUpdatedActivityCount(issueId);
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.escalated).toBe(0);
+    expect(second.issueIds).toEqual([]);
+    expect(second.assignmentDispatched).toBe(0);
+    expect(second.dispatchRequeued).toBe(0);
+    expect(second.continuationRequeued).toBe(0);
+
+    const [afterSecond] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(afterSecond).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    expect(afterSecond!.updatedAt.getTime()).toBe(afterFirst!.updatedAt.getTime());
+    expect(await issueUpdatedActivityCount(issueId)).toBe(updatedActivityAfterFirst);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toEqual([]);
+    expect(
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId)),
+    ).toEqual([]);
+  });
+
+  it.each(["paused", "terminated", "pending_approval"] as const)(
+    "does not attempt a conversation-comment wake when the conversation agent is %s",
+    async (agentStatus) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        defaultResponsibleUserId: "responsible-user",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Chatter",
+        role: "engineer",
+        status: agentStatus,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Agent chat with undelivered user input",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+        responsibleUserId: "responsible-user",
+        conversationAgentId: agentId,
+        conversationUserId: "responsible-user",
+        conversationState: "active",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+      const [comment] = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "responsible-user",
+          body: "Please summarize the run",
+          clientRequestId: randomUUID(),
+        })
+        .returning();
+
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+      try {
+        const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+        expect(result.escalated).toBe(0);
+        expect(result.issueIds).toEqual([]);
+        expect(result.skipped).toBe(1);
+
+        // Without the gate the sweep throws the 409 out of the whole reconcile
+        // loop, which aborts every remaining recovery stage chained after it.
+        expect(
+          await db
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.agentId, agentId)),
+        ).toEqual([]);
+        expect(
+          await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.agentId, agentId)),
+        ).toEqual([]);
+        // The comment stays undelivered so the resume can deliver it.
+        expect(
+          await db
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              eq(
+                agentWakeupRequests.idempotencyKey,
+                `conversation-comment:${comment!.id}`,
+              ),
+            ),
+        ).toEqual([]);
+        const [issue] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        expect(issue).toMatchObject({
+          status: "in_progress",
+          conversationState: "active",
+        });
+      } finally {
+        await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+      }
+    },
+  );
 
   it("re-enqueues assigned todo work when the last issue run died and no wake remains", async () => {
     const { companyId, agentId, issueId, runId } =

@@ -113,7 +113,11 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  evaluateAgentInvokability,
+  evaluateAgentInvokabilityFromDb,
+  type AgentOrgRow,
+} from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -2734,6 +2738,13 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
+    // `blocked` is this helper's only target state and it never rewrites
+    // blockers, so an issue that is already blocked is already escalated. Both
+    // callers are level-triggered and can re-present the same row, and this
+    // helper has no comment dedup: without this guard a second pass bumps
+    // `updatedAt`, posts a second operator comment, and emits a second
+    // `issue.updated` activity row for a transition that already happened.
+    if (input.issue.status === "blocked") return null;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
     });
@@ -2858,6 +2869,29 @@ export function recoveryService(
     return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) =>
       rows.map((row) => row.id),
     );
+  }
+
+  /**
+   * True when a stranded escalation would rewrite an issue that already holds
+   * the target state (`blocked`) with the exact blocker set this escalation
+   * would persist. Callers are level-triggered and re-present the same row, so
+   * re-running the update would bump `updatedAt`, re-run the blocker relation
+   * sync, and emit a duplicate `issue.updated` activity row for a transition
+   * that already happened. A changed blocker set is a real change and is not
+   * suppressed.
+   */
+  async function isStrandedEscalationAlreadyApplied(
+    issue: typeof issues.$inferSelect,
+    blockerIds: string[],
+  ) {
+    if (issue.status !== "blocked") return false;
+    const persistedBlockerIds = await existingBlockerIssueIds(
+      issue.companyId,
+      issue.id,
+    );
+    if (persistedBlockerIds.length !== blockerIds.length) return false;
+    const persisted = new Set(persistedBlockerIds);
+    return blockerIds.every((blockerId) => persisted.has(blockerId));
   }
 
   async function openChildIssues(issue: typeof issues.$inferSelect) {
@@ -3915,6 +3949,13 @@ export function recoveryService(
       });
     }
 
+    const blockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (await isStrandedEscalationAlreadyApplied(input.issue, blockerIds)) {
+      return null;
+    }
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
       input.recoveryCause,
@@ -3938,10 +3979,6 @@ export function recoveryService(
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
-    );
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
@@ -4398,6 +4435,19 @@ export function recoveryService(
           }
         }
         if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        const conversationAgent = await getAgent(issue.conversationAgentId);
+        if (
+          !conversationAgent ||
+          conversationAgent.companyId !== issue.companyId ||
+          !(await isAgentInvokable(conversationAgent))
+        ) {
+          // Redelivering here would ask `enqueueWakeup` to wake a
+          // paused/terminated/pending-approval agent; that throws a 409 which
+          // aborts the whole sweep, not just this issue. Leave the undelivered
+          // comments in place for the resume instead.
+          result.skipped += 1;
+          continue;
+        }
         {
           await deliverConversationComments(db, issue, deps.enqueueWakeup);
         }
@@ -5533,6 +5583,7 @@ export function recoveryService(
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
+      nonInvokableSkipped: 0,
       notReadySkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
@@ -5658,6 +5709,20 @@ export function recoveryService(
         companyId,
         companyCandidates.map((candidate) => candidate.id),
       );
+      // One org read per company page: invokability is an org-chain decision, so
+      // it needs the whole company roster, not just the assignee row. Reading it
+      // here keeps the gate below off the per-candidate query path.
+      const orgRows: AgentOrgRow[] = await db
+        .select({
+          id: agents.id,
+          companyId: agents.companyId,
+          name: agents.name,
+          reportsTo: agents.reportsTo,
+          status: agents.status,
+        })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+      const orgRowByAgentId = new Map(orgRows.map((row) => [row.id, row]));
 
       for (const candidate of companyCandidates) {
         const agentId = candidate.assigneeAgentId;
@@ -5719,6 +5784,20 @@ export function recoveryService(
           )
         ) {
           result.pauseHoldSkipped += 1;
+          continue;
+        }
+
+        const assigneeOrgRow = orgRowByAgentId.get(agentId) ?? null;
+        if (
+          !assigneeOrgRow ||
+          !evaluateAgentInvokability(assigneeOrgRow, orgRows).invokable
+        ) {
+          // A paused / terminated / pending-approval assignee cannot be woken by
+          // this automatic sweep. `enqueueWakeup` rejects it with a 409 and
+          // writes an `agent.not_invokable` skipped request on every pass, so
+          // gate here and leave the blocked issue to an explicit human
+          // resume/reassignment.
+          result.nonInvokableSkipped += 1;
           continue;
         }
 

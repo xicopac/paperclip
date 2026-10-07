@@ -159,6 +159,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await tempDb?.cleanup();
   });
 
+  function issueUpdatedActivityCount(companyId: string, issueId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.action, "issue.updated"),
+        ),
+      )
+      .then((rows) => rows.length);
+  }
+
   async function seedCompany() {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -1560,6 +1575,215 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(1);
     expect(recoveryIssues[0]?.status).toBe("blocked");
+  });
+
+  it("is a no-op when a stranded assignment is re-presented already blocked with the same blockers", async () => {
+    const { companyId, coderId, sourceIssue, sourceIssueId } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+    const escalate = (issue: typeof issues.$inferSelect) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+
+    expect(await escalate(sourceIssue)).toMatchObject({ status: "blocked" });
+
+    // A level-triggered caller re-reads the row and presents it again.
+    const [afterFirst] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    const activityAfterFirst = await issueUpdatedActivityCount(companyId, sourceIssueId);
+    const commentsAfterFirst = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    const actionAfterFirst = (
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId))
+    )[0]!;
+
+    expect(await escalate(afterFirst!)).toBeNull();
+
+    const [afterSecond] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(afterSecond!.updatedAt.getTime()).toBe(afterFirst!.updatedAt.getTime());
+    expect(await issueUpdatedActivityCount(companyId, sourceIssueId)).toBe(activityAfterFirst);
+    expect(
+      await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssueId)),
+    ).toHaveLength(commentsAfterFirst.length);
+    const actionAfterSecond = (
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId))
+    )[0]!;
+    expect(actionAfterSecond.attemptCount).toBe(actionAfterFirst.attemptCount);
+  });
+
+  it("still re-escalates a blocked issue whose unresolved blocker set changed", async () => {
+    const { companyId, coderId, sourceIssue, sourceIssueId, prefix } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    const blockerIssueIds = [randomUUID(), randomUUID()];
+    await db.insert(issues).values(
+      blockerIssueIds.map((blockerIssueId, index) => ({
+        id: blockerIssueId,
+        companyId,
+        title: `Blocker ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        issueNumber: 8 + index,
+        identifier: `${prefix}-${8 + index}`,
+      })),
+    );
+    await db.insert(issueRelations).values(
+      blockerIssueIds.map((blockerIssueId) => ({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: sourceIssueId,
+        type: "blocks" as const,
+      })),
+    );
+
+    expect(
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+      }),
+    ).toMatchObject({ status: "blocked" });
+    expect(
+      (
+        await db
+          .select({ issueId: issueRelations.issueId })
+          .from(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.companyId, companyId),
+              eq(issueRelations.relatedIssueId, sourceIssueId),
+              eq(issueRelations.type, "blocks"),
+            ),
+          )
+      ).map((row) => row.issueId).sort(),
+    ).toEqual([...blockerIssueIds].sort());
+
+    // One blocker resolves, so the persisted blocker set no longer matches the
+    // unresolved set this escalation would write. That is real work.
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, blockerIssueIds[1]!));
+
+    const [blocked] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(
+      await recovery.escalateStrandedAssignedIssue({
+        issue: blocked!,
+        previousStatus: "in_progress",
+        latestRun,
+      }),
+    ).toMatchObject({ status: "blocked" });
+
+    const blockers = await db
+      .select({ issueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, sourceIssueId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    expect(blockers.map((row) => row.issueId)).toEqual([blockerIssueIds[0]!]);
+  });
+
+  it("is a no-op when a recovery issue is re-presented already blocked", async () => {
+    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const recoveryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Recover stalled issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      parentId: sourceIssueId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+      originKind: "stranded_issue_recovery",
+      originId: sourceIssueId,
+      originFingerprint: `stranded_issue_recovery:${sourceIssueId}`,
+    });
+    const [recoveryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    const latestRun = {
+      id: randomUUID(),
+      agentId: managerId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+    const escalate = (issue: typeof issues.$inferSelect) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun,
+      });
+
+    expect(await escalate(recoveryIssue!)).toMatchObject({ status: "blocked" });
+
+    const [afterFirst] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    const commentsAfterFirst = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, recoveryIssueId));
+    const activityAfterFirst = await issueUpdatedActivityCount(companyId, recoveryIssueId);
+
+    // In-place escalation has no comment dedup of its own, so the guard is the
+    // only thing keeping a repeated pass from re-notifying the operator.
+    expect(await escalate(afterFirst!)).toBeNull();
+
+    const [afterSecond] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    expect(afterSecond!.updatedAt.getTime()).toBe(afterFirst!.updatedAt.getTime());
+    expect(
+      await db.select().from(issueComments).where(eq(issueComments.issueId, recoveryIssueId)),
+    ).toHaveLength(commentsAfterFirst.length);
+    expect(await issueUpdatedActivityCount(companyId, recoveryIssueId)).toBe(activityAfterFirst);
   });
 
   it("exposes active recovery actions on the issue read API", async () => {

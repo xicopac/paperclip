@@ -225,6 +225,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    assigneeStatus?: "idle" | "paused" | "terminated" | "pending_approval";
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
@@ -255,7 +256,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       companyId,
       name: "Priya",
       role: "engineer",
-      status: "idle",
+      status: opts.assigneeStatus ?? "idle",
       adapterType: "test_adapter",
       adapterConfig: {},
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
@@ -432,6 +433,54 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       ]),
     });
   });
+
+  it.each(["paused", "terminated", "pending_approval"] as const)(
+    "never wakes a %s assignee from the resolved dependency backstop",
+    async (assigneeStatus) => {
+      const { companyId, agentId, blockedIssueId } =
+        await seedResolvedDependencyBackstopFixture({
+          workspaceState: "none",
+          assigneeStatus,
+        });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileResolvedDependencyWakes();
+
+      expect(result.checked).toBe(1);
+      expect(result.healed).toBe(0);
+      expect(result.nonInvokableSkipped).toBe(1);
+      expect(result.enqueueFailed).toBe(0);
+      expect(result.deferredOrFailed).toBe(0);
+      expect(result.issueIds).toEqual([]);
+
+      // Without the gate this is an `agent.not_invokable` skipped request plus a
+      // 409, written again on every sweep.
+      const wakes = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes).toEqual([]);
+
+      const events = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
+          ),
+        );
+      expect(events).toEqual([]);
+
+      // The healed-liveness obligation stays exactly where it was.
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId));
+      expect(issue?.status).toBe("blocked");
+      await heartbeat.drainActiveRunExecutions();
+    },
+  );
 
   it("keeps resolved dependency wake reconciliation active", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
