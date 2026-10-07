@@ -38,10 +38,17 @@ This script:
 
 1. runs the forbidden token check unless `--skip-checks` is supplied
 2. runs `pnpm -r typecheck`
-3. bundles the CLI entrypoint with esbuild into `cli/dist/index.js`
-4. verifies the bundled entrypoint with `node --check`
-5. rewrites `cli/package.json` into a publishable npm manifest and stores the dev copy as `cli/package.dev.json`
-6. copies the repo `README.md` into `cli/README.md` for npm metadata, rewriting
+3. stages the generated server publish artifacts — `server/ui-dist` (via
+   [`scripts/prepare-server-ui-dist.sh`](../scripts/prepare-server-ui-dist.sh)) and
+   the bundled `skills` directories copied from the repo-root `skills/` — because
+   `scripts/prepare-bundled-package.mjs` copies each package's `files` entries
+   verbatim and no `build` script emits them. Set `PAPERCLIP_RELEASE_REUSE_UI_DIST=1`
+   to reuse an existing `ui/dist` instead of rebuilding the UI; `scripts/release.sh`
+   sets it, so the release flow stages these once in its Step 2/7 and reuses them here
+4. bundles the CLI entrypoint with esbuild into `cli/dist/index.js`
+5. verifies the bundled entrypoint with `node --check`
+6. rewrites `cli/package.json` into a publishable npm manifest and stores the dev copy as `cli/package.dev.json`
+7. copies the repo `README.md` into `cli/README.md` for npm metadata, rewriting
    repository-relative image assets to raw GitHub URLs pinned to the source
    commit
 
