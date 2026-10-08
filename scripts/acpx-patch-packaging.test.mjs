@@ -161,6 +161,26 @@ test("bundled package staging materializes publishConfig entrypoints", () => {
   assert.deepEqual(staged.exports, adapterUtilsPackage.publishConfig.exports);
 });
 
+test("bundled package staging drops pack-time lifecycle scripts from the staged manifest", () => {
+  const staged = materializePublishManifest(serverPackage);
+
+  assert.equal(
+    serverPackage.scripts.prepack,
+    "pnpm run prepare:ui-dist && pnpm run build",
+    "the repository manifest keeps its pack-time build hook",
+  );
+  assert.equal(serverPackage.scripts.postpack, "rm -rf ui-dist");
+  for (const name of ["prepack", "prepare", "postpack"]) {
+    assert.equal(
+      staged.scripts?.[name],
+      undefined,
+      `staged ${name} would run repo-relative commands from the flattened staging directory`,
+    );
+  }
+  assert.equal(staged.scripts.build, serverPackage.scripts.build);
+  assert.equal(staged.scripts.start, "node dist/index.js");
+});
+
 test("bundled package staging materializes workspace dependency versions", () => {
   const staged = materializePublishManifest({
     name: "@paperclipai/example",
@@ -375,6 +395,14 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
   assert.equal(lstatSync(stagedAcpxDir).isDirectory(), true);
   assert.equal(lstatSync(stagedAcpxDir).isSymbolicLink(), false);
   assert.equal(existsSync(join(destinationDir, "node_modules/.pnpm")), false);
+  const stagedManifest = JSON.parse(readFileSync(join(destinationDir, "package.json"), "utf8"));
+  for (const name of ["prepack", "prepare", "postpack"]) {
+    assert.equal(
+      stagedManifest.scripts?.[name],
+      undefined,
+      `the staged package.json must not declare ${name}; npm runs it while packing the flattened staging directory`,
+    );
+  }
   assert.match(
     readFileSync(join(stagedAcpxDir, "dist/runtime.js"), "utf8"),
     /spawnEnvironment/,

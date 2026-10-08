@@ -7,12 +7,34 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
+// npm runs these while packing a directory (`prepack` -> `prepare` -> `postpack`).
+// They can only work from the repository layout: a staged copy is flattened into
+// its own directory, so repo-relative paths such as server's
+// `bash ../scripts/prepare-server-ui-dist.sh` cannot resolve, and its `build`
+// script reaches sibling workspaces (`../packages/paperclip-runner/dist`) that
+// the staging root does not contain. Every `files` entry of a staged copy is
+// already built by the caller before staging, so running them during pack would
+// at best rebuild the artifact and at worst fail the install. Releasing and
+// previewing already pack staged copies with `--ignore-scripts`; declaring these
+// scripts in the staged manifest keeps a plain `npm pack` on the same staged copy
+// consistent with them instead of depending on the caller's flags.
+const PACK_TIME_LIFECYCLE_SCRIPTS = ["prepack", "prepare", "postpack"];
+
 export function materializePublishManifest(pkg) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
+  }
+
+  if (pkg.scripts) {
+    // Clone first: the manifest copy is shallow, so deleting in place would also
+    // strip the lifecycle scripts from the caller's parsed source manifest.
+    const scripts = { ...pkg.scripts };
+    for (const name of PACK_TIME_LIFECYCLE_SCRIPTS) delete scripts[name];
+    if (Object.keys(scripts).length === 0) delete publishManifest.scripts;
+    else publishManifest.scripts = scripts;
   }
 
   for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
