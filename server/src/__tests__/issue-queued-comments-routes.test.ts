@@ -846,6 +846,79 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(recovery.evidence.automaticRecovery).toMatchObject({ actionOutcome: "unknown" });
   });
 
+  it("keeps a stranded saved legacy comment pending while its agent is paused, then delivers it after the agent resumes", async () => {
+    const seeded = await seedQueue();
+    await db.update(agents).set({ adapterType: "claude_local", status: "paused",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "failed",
+      processPid: process.pid, errorCode: "process_lost", finishedAt: new Date("2026-08-22T15:03:00.000Z"),
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: seeded.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: seeded.runId,
+      status: "resolved", outcome: "blocked", nextAction: "Automatic recovery stopped.",
+      evidence: { runId: seeded.runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    });
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() },
+    });
+
+    await expect(heartbeatService(db).resumeQueuedRuns()).resolves.toBeUndefined();
+    const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    expect(pending.status).toBe("deferred_issue_execution");
+    expect(pending.runId).toBeNull();
+    // A suppressed attempt dispatches nothing and writes no new receipt.
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId)))
+      .toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId)))
+      .toHaveLength(2);
+
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ processPid: 999999999 }).where(eq(heartbeatRuns.id, seeded.runId));
+    await Promise.all([heartbeatService(db).resumeQueuedRuns(), heartbeatService(db).resumeQueuedRuns()]);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    expect(delivered.status).toBe("coalesced");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.contextSnapshot).toMatchObject({ wakeCommentIds: seeded.commentIds,
+      previousRunId: seeded.runId, forceFreshSession: true });
+  });
+
+  it("skips a periodic queued-comment delivery for a non-invokable agent without a 409, and still reports one to an interrupt click", async () => {
+    const seeded = await seedQueue();
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(agentWakeupRequests).set({ payload: { ...saved.payload,
+      queuedCommentInterrupt: { actorId: "other-operator", requestedAt: new Date().toISOString() },
+    } }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(agents).set({ adapterType: "claude_local", status: "paused",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "failed",
+      processPid: process.pid, errorCode: "process_lost", finishedAt: new Date("2026-08-22T15:03:00.000Z"),
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() },
+    });
+
+    // The periodic pass that used to throw a 409 every tick must stay silent and
+    // leave the durable interrupt intent and its comments on the same queue.
+    await expect(heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId))
+      .resolves.toBeUndefined();
+    const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    expect(pending.status).toBe("deferred_issue_execution");
+    expect(pending.runId).toBeNull();
+    expect(pending.payload?.queuedCommentInterrupt).toMatchObject({ actorId: "other-operator" });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId)))
+      .toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId)))
+      .toHaveLength(2);
+
+    // One explicit board click still gets the block reported to its caller.
+    await expect(heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId, { retryCleanup: true }))
+      .rejects.toMatchObject({ status: 409, details: { status: "paused", reason: "paused" } });
+  });
+
   it("recovers a message deferred after legacy finalization released the task lock", async () => {
     const seeded = await seedQueue();
     await db.update(agents).set({ adapterType: "claude_local",

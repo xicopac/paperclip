@@ -10363,6 +10363,19 @@ export function heartbeatService(
     if (!actorId) return;
     const agent = await getAgent(wake.agentId);
     if (!agent || agent.companyId !== companyId || (agent.adapterType === "paperclip_runner" && !response?.source.requiresFreshSession)) return;
+    // A non-invokable agent cannot accept this wake, and admission would reject
+    // every retry with a 409. Skip instead: the queue stays deferred with its
+    // saved comments intact for the next invokable pass. Only an explicit HTTP
+    // interrupt click keeps the thrown 409 as caller feedback.
+    if (!opts?.retryCleanup) {
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) {
+        logger.debug({ agentId: agent.id, companyId, queueId, issueId, reason: invokability.reason,
+          invalidOrgChain: invokability.invalidOrgChain, ...invokability.details },
+        "saved legacy comment delivery skipped because the agent is not invokable");
+        return;
+      }
+    }
     const [active] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.agentId, wake.agentId),
