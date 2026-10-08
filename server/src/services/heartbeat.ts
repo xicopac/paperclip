@@ -19794,8 +19794,19 @@ export function heartbeatService(
     }
   }
 
+  // Only "terminated" keeps the lock: it is the one direct non-invokable status
+  // whose cancels must stay serialized against a concurrent queued-run start.
+  // Paused / pending_approval cancel nothing, so they skip the lock entirely.
+  async function agentStartNeedsAgentStartLock(agentId: string) {
+    const agent = await getAgent(agentId);
+    if (!agent) return false;
+    if (!DIRECT_NON_INVOKABLE_STATUSES.has(agent.status)) return true;
+    return agent.status === "terminated";
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
+    if (!(await agentStartNeedsAgentStartLock(agentId))) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
