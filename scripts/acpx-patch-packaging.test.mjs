@@ -15,15 +15,18 @@ import { join } from "node:path";
 import test from "node:test";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
+import { fileURLToPath } from "node:url";
 
 import cliEsbuildConfig from "../cli/esbuild.config.mjs";
 import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspacePackageVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const adapterUtilsPackage = JSON.parse(
   await readFile(new URL("../packages/adapter-utils/package.json", import.meta.url), "utf8"),
@@ -36,6 +39,15 @@ const serverPackage = JSON.parse(
 );
 const dbPackage = JSON.parse(
   await readFile(new URL("../packages/db/package.json", import.meta.url), "utf8"),
+);
+const pluginSdkPackage = JSON.parse(
+  await readFile(new URL("../packages/plugins/sdk/package.json", import.meta.url), "utf8"),
+);
+const hermesGatewayPackage = JSON.parse(
+  await readFile(new URL("../packages/adapters/hermes-gateway/package.json", import.meta.url), "utf8"),
+);
+const sharedPackage = JSON.parse(
+  await readFile(new URL("../packages/shared/package.json", import.meta.url), "utf8"),
 );
 const releaseScript = await readFile(new URL("./release.sh", import.meta.url), "utf8");
 const releaseLib = await readFile(new URL("./release-lib.sh", import.meta.url), "utf8");
@@ -193,6 +205,120 @@ test("bundled package staging materializes workspace dependency versions", () =>
     caret: "^2026.723.0",
     tilde: "~2026.723.0",
   });
+});
+
+test("bundled package staging pins workspace dependencies to their own version", () => {
+  const staged = materializePublishManifest(
+    {
+      name: "@paperclipai/example",
+      version: "2026.723.0",
+      dependencies: { exact: "workspace:*", caret: "workspace:^", tilde: "workspace:~" },
+    },
+    {
+      workspacePackageVersions: new Map([
+        ["exact", "1.0.0"],
+        ["caret", "0.1.0"],
+        ["tilde", "0.2.3"],
+      ]),
+    },
+  );
+
+  assert.deepEqual(staged.dependencies, {
+    exact: "1.0.0",
+    caret: "^0.1.0",
+    tilde: "~0.2.3",
+  });
+});
+
+test("bundled package staging rejects a workspace dependency it cannot pin", () => {
+  assert.throws(
+    () =>
+      materializePublishManifest(
+        {
+          name: "@paperclipai/example",
+          version: "2026.723.0",
+          dependencies: { "@paperclipai/unlisted": "workspace:*" },
+        },
+        { workspacePackageVersions: new Map([["@paperclipai/listed", "1.0.0"]]) },
+      ),
+    /@paperclipai\/example declares a workspace dependency on @paperclipai\/unlisted, which is missing from scripts\/release-package-manifest\.json/,
+  );
+});
+
+test("staged git-install manifests pin every workspace dependency to a staged tarball version", () => {
+  // `paperclipai install --ref` stages one tarball per workspace package reachable
+  // from @paperclipai/server (cli/src/commands/install.ts) and installs them
+  // together. A pin that names any version other than the version of a staged
+  // tarball cannot resolve locally, so npm falls through to the registry and fails
+  // ETARGET -- the failure that shipped plugin-sdk@1.0.0 pinned to the 0.3.1 calver.
+  const registry = readWorkspacePackageVersions(repoRoot);
+  const bundledStaged = new Map([
+    ["@paperclipai/server", materializePublishManifest(serverPackage, { workspacePackageVersions: registry })],
+    ["@paperclipai/db", materializePublishManifest(dbPackage, { workspacePackageVersions: registry })],
+    [
+      "@paperclipai/adapter-utils",
+      materializePublishManifest(adapterUtilsPackage, { workspacePackageVersions: registry }),
+    ],
+  ]);
+
+  assert.equal(
+    bundledStaged.get("@paperclipai/server").dependencies["@paperclipai/plugin-sdk"],
+    pluginSdkPackage.version,
+    "the bundled server manifest must not rewrite the standalone SDK to the app calver",
+  );
+  assert.notEqual(pluginSdkPackage.version, serverPackage.version);
+  assert.ok(
+    (serverPackage.bundleDependencies ?? []).length > 0,
+    "the server is staged through materializePublishManifest, not pnpm pack",
+  );
+
+  // Nothing here may special-case the SDK: every out-of-band train the checkout
+  // carries (the standalone 1.x plugin SDK, the 0.1.x hermes-gateway adapter and
+  // catalogs) has to reach the registry so a `workspace:` edge onto any of them
+  // pins that package's own version instead of the app calver.
+  for (const outOfBand of [pluginSdkPackage, hermesGatewayPackage]) {
+    assert.notEqual(outOfBand.version, serverPackage.version, `${outOfBand.name} rides its own train`);
+    assert.equal(
+      registry.get(outOfBand.name),
+      outOfBand.version,
+      `${outOfBand.name} must be resolvable from its own manifest version`,
+    );
+  }
+  const dependsOnOutOfBand = materializePublishManifest(
+    {
+      name: "@paperclipai/example",
+      version: serverPackage.version,
+      dependencies: {
+        "@paperclipai/plugin-sdk": "workspace:*",
+        "@paperclipai/adapter-hermes-gateway": "workspace:*",
+        "@paperclipai/shared": "workspace:*",
+      },
+    },
+    { workspacePackageVersions: registry },
+  );
+  assert.equal(dependsOnOutOfBand.dependencies["@paperclipai/plugin-sdk"], pluginSdkPackage.version);
+  assert.equal(
+    dependsOnOutOfBand.dependencies["@paperclipai/adapter-hermes-gateway"],
+    hermesGatewayPackage.version,
+  );
+  assert.equal(
+    dependsOnOutOfBand.dependencies["@paperclipai/shared"],
+    sharedPackage.version,
+    "an app-train workspace edge keeps pinning the calver the staged tarball carries",
+  );
+
+  for (const [name, staged] of bundledStaged) {
+    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+      for (const [dependency, specifier] of Object.entries(staged[section] ?? {})) {
+        if (!dependency.startsWith("@paperclipai/")) continue;
+        assert.equal(
+          registry.get(dependency),
+          specifier,
+          `${name} ${section}.${dependency} must pin the dependency's own manifest version`,
+        );
+      }
+    }
+  }
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {

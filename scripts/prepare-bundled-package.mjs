@@ -20,7 +20,54 @@ const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 // consistent with them instead of depending on the caller's flags.
 const PACK_TIME_LIFECYCLE_SCRIPTS = ["prepack", "prepare", "postpack"];
 
-export function materializePublishManifest(pkg) {
+const RELEASE_PACKAGE_MANIFEST = "scripts/release-package-manifest.json";
+
+// Workspace packages do not share a single version train. `@paperclipai/plugin-sdk`
+// is published as a standalone 1.x SDK whose major is tied to the plugin apiVersion
+// (doc/plugins/PLUGIN_SPEC.md), adapters/catalogs/plugins ship 0.1.x, and the app
+// packages ride the 0.3.x calver. `release-package-map.mjs set-version` flattens
+// them onto one calver before `npm publish`, so on the release path every
+// `workspace:` edge really does match the depending package's version. The
+// git-install path (cli/src/commands/install.ts) never runs that rewrite: it packs
+// the checkout as-is, so rewriting a `workspace:` edge to the *depending* package's
+// version asks npm for a version no staged tarball carries and no release has ever
+// published, and npm falls through to the registry with ETARGET. Resolve each
+// workspace edge against the dependency's own manifest instead.
+export function readWorkspacePackageVersions(sourceRoot = repoRoot) {
+  const manifestPath = resolve(sourceRoot, RELEASE_PACKAGE_MANIFEST);
+  const entries = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const versions = new Map();
+
+  for (const entry of entries) {
+    if (typeof entry?.name !== "string" || typeof entry?.dir !== "string") continue;
+    const manifest = JSON.parse(
+      readFileSync(resolve(sourceRoot, entry.dir, "package.json"), "utf8"),
+    );
+    if (typeof manifest.version === "string" && manifest.version.length > 0) {
+      versions.set(entry.name, manifest.version);
+    }
+  }
+
+  return versions;
+}
+
+function resolveWorkspaceDependencyVersion(name, pkg, workspacePackageVersions) {
+  // Callers that materialize a flat train (the release rewrite, the preview
+  // builder) rewrite the specifiers themselves and pass no registry, so there is
+  // nothing to look up and the package version stays the answer.
+  if (workspacePackageVersions === undefined) return pkg.version;
+
+  const resolved = workspacePackageVersions.get(name);
+  if (typeof resolved !== "string" || resolved.length === 0) {
+    throw new Error(
+      `${pkg.name} declares a workspace dependency on ${name}, which is missing from ${RELEASE_PACKAGE_MANIFEST}. ` +
+        `Add it so the staged manifest can pin the dependency's own version, or drop the workspace dependency.`,
+    );
+  }
+  return resolved;
+}
+
+export function materializePublishManifest(pkg, { workspacePackageVersions } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -44,7 +91,7 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        return [name, `${prefix}${resolveWorkspaceDependencyVersion(name, pkg, workspacePackageVersions)}`];
       }),
     );
   }
@@ -178,7 +225,9 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, {
+    workspacePackageVersions: readWorkspacePackageVersions(sourceRoot),
+  });
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
